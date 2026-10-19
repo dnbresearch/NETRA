@@ -1,0 +1,403 @@
+"""LLM / VLM client with unified interface, cost tracking, and retry logic."""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+
+# ── Token pricing (USD per 1K tokens, as of early 2025) ──────────────────────
+PRICING = {
+    "gpt-4o": {"input": 0.0025, "output": 0.01},
+    "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
+    "gpt-4-turbo": {"input": 0.01, "output": 0.03},
+    "gemini-2.0-flash": {"input": 0.0001, "output": 0.0004},
+    "gemini-2.5-pro": {"input": 0.00125, "output": 0.005},
+    "gemini-2.5-flash": {"input": 0.00015, "output": 0.0006},
+    "gemini-2.5-flash-lite": {"input": 0.000075, "output": 0.0003},
+    "claude-sonnet-4-20250514": {"input": 0.003, "output": 0.015},
+    "claude-haiku-4-5-20251001": {"input": 0.0008, "output": 0.004},
+    "qwen2-vl-72b": {"input": 0.0, "output": 0.0},  # self-hosted
+}
+
+
+@dataclass
+class TokenUsage:
+    """Tracks token counts and cost for a single LLM call."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    model: str = ""
+    latency_s: float = 0.0
+
+    @property
+    def cost_usd(self) -> float:
+        prices = PRICING.get(self.model, {"input": 0.01, "output": 0.03})
+        return (
+            self.input_tokens * prices["input"] / 1000
+            + self.output_tokens * prices["output"] / 1000
+        )
+
+
+@dataclass
+class CostTracker:
+    """Aggregates costs across all LLM calls in a pipeline run."""
+
+    records: list[TokenUsage] = field(default_factory=list)
+    agent_costs: dict[str, float] = field(default_factory=dict)
+
+    def record(self, usage: TokenUsage, agent_name: str = "unknown") -> None:
+        self.records.append(usage)
+        self.agent_costs[agent_name] = self.agent_costs.get(agent_name, 0.0) + usage.cost_usd
+
+    @property
+    def total_cost(self) -> float:
+        return sum(r.cost_usd for r in self.records)
+
+    @property
+    def total_input_tokens(self) -> int:
+        return sum(r.input_tokens for r in self.records)
+
+    @property
+    def total_output_tokens(self) -> int:
+        return sum(r.output_tokens for r in self.records)
+
+    @property
+    def total_latency(self) -> float:
+        return sum(r.latency_s for r in self.records)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "total_cost_usd": round(self.total_cost, 4),
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "total_calls": len(self.records),
+            "total_latency_s": round(self.total_latency, 1),
+            "per_agent": {k: round(v, 4) for k, v in self.agent_costs.items()},
+        }
+
+
+class LLMClient:
+    """Unified LLM client supporting OpenAI, Anthropic, Google, and OpenAI-compatible APIs.
+
+    OpenAI-compatible providers (Together, Groq, Ollama, vLLM) are supported via
+    base_url parameter, enabling open-source models like LLaMA, Mistral, Gemma, etc.
+    """
+
+    # Known provider base URLs
+    PROVIDER_URLS = {
+        "together": "https://api.together.xyz/v1",
+        "groq": "https://api.groq.com/openai/v1",
+        "ollama": "http://localhost:11434/v1",
+        "vllm": "http://localhost:8000/v1",
+    }
+
+    # Map provider names to API key env vars
+    PROVIDER_API_KEYS = {
+        "together": "TOGETHER_API_KEY",
+        "groq": "GROQ_API_KEY",
+    }
+
+    def __init__(
+        self,
+        model: str = "gpt-4o",
+        provider: str = "openai",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        temperature: float = 0.3,
+        max_tokens: int = 4096,
+        max_retries: int = 3,
+        cost_tracker: Optional[CostTracker] = None,
+    ):
+        self.model = model
+        self.provider = provider
+        self.base_url = base_url
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.max_retries = max_retries
+        self.cost_tracker = cost_tracker or CostTracker()
+        self._client = self._init_client(provider, api_key, base_url)
+
+    def _init_client(self, provider: str, api_key: Optional[str], base_url: Optional[str] = None):
+        if provider == "openai":
+            try:
+                from openai import OpenAI
+                return OpenAI(api_key=api_key) if api_key else OpenAI()
+            except ImportError:
+                raise ImportError("pip install openai")
+        elif provider == "anthropic":
+            try:
+                from anthropic import Anthropic
+                return Anthropic(api_key=api_key) if api_key else Anthropic()
+            except ImportError:
+                raise ImportError("pip install anthropic")
+        elif provider == "google":
+            # Try new google-genai SDK first (Gemini 2.5+)
+            try:
+                from google import genai
+                client = genai.Client(api_key=api_key) if api_key else genai.Client()
+                return client
+            except ImportError:
+                pass
+            # Fallback to old google-generativeai SDK
+            try:
+                import google.generativeai as genai
+                if api_key:
+                    genai.configure(api_key=api_key)
+                return genai
+            except ImportError:
+                raise ImportError("pip install google-genai (or google-generativeai)")
+        elif provider in self.PROVIDER_URLS or base_url:
+            # OpenAI-compatible providers (Together, Groq, Ollama, vLLM, etc.)
+            try:
+                import os
+                from openai import OpenAI
+                url = base_url or self.PROVIDER_URLS.get(provider)
+                if not api_key:
+                    env_var = self.PROVIDER_API_KEYS.get(provider, f"{provider.upper()}_API_KEY")
+                    api_key = os.environ.get(env_var, "no-key-needed")
+                return OpenAI(api_key=api_key, base_url=url)
+            except ImportError:
+                raise ImportError("pip install openai")
+        else:
+            raise ValueError(f"Unsupported provider: {provider}")
+
+    # ── Core call ─────────────────────────────────────────────────────────
+    def call(
+        self,
+        prompt: str,
+        system: str = "",
+        images: Optional[list[str | Path]] = None,
+        json_mode: bool = False,
+        agent_name: str = "unknown",
+    ) -> str:
+        """Send a prompt (with optional images) to the LLM and return text.
+
+        Args:
+            prompt: User message text.
+            system: System prompt.
+            images: List of image file paths or base64 strings.
+            json_mode: Request JSON-formatted output.
+            agent_name: For cost tracking attribution.
+
+        Returns:
+            Model response text.
+        """
+        for attempt in range(self.max_retries):
+            try:
+                t0 = time.time()
+                if self.provider == "openai" or self.provider in self.PROVIDER_URLS or self.base_url:
+                    text, usage = self._call_openai(prompt, system, images, json_mode)
+                elif self.provider == "anthropic":
+                    text, usage = self._call_anthropic(prompt, system, images, json_mode)
+                elif self.provider == "google":
+                    text, usage = self._call_google(prompt, system, images, json_mode)
+                else:
+                    raise ValueError(f"Unknown provider {self.provider}")
+
+                usage.latency_s = time.time() - t0
+                usage.model = self.model
+                self.cost_tracker.record(usage, agent_name)
+                return text
+
+            except Exception as e:
+                logger.warning(f"LLM call attempt {attempt + 1} failed: {e}")
+                if attempt == self.max_retries - 1:
+                    raise
+                time.sleep(2 ** attempt)
+
+        raise RuntimeError("LLM call failed after all retries")
+
+    def call_json(
+        self,
+        prompt: str,
+        system: str = "",
+        images: Optional[list[str | Path]] = None,
+        agent_name: str = "unknown",
+    ) -> dict:
+        """Call LLM and parse response as JSON."""
+        if "json" not in prompt.lower() and "json" not in system.lower():
+            prompt += "\n\nRespond ONLY with valid JSON. No markdown fences."
+        text = self.call(prompt, system, images, json_mode=True, agent_name=agent_name)
+        # Strip markdown code fences if present
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+        return json.loads(text)
+
+    # ── Provider-specific implementations ─────────────────────────────────
+    def _call_openai(self, prompt, system, images, json_mode):
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+
+        content = [{"type": "text", "text": prompt}]
+        if images:
+            for img in images:
+                b64 = self._encode_image(img)
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"},
+                })
+        messages.append({"role": "user", "content": content})
+
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+        }
+        # GPT-5+ models require max_completion_tokens instead of max_tokens
+        if self.model.startswith("gpt-5") or self.model.startswith("o1") or self.model.startswith("o3"):
+            kwargs["max_completion_tokens"] = self.max_tokens
+        else:
+            kwargs["max_tokens"] = self.max_tokens
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        try:
+            resp = self._client.chat.completions.create(**kwargs)
+        except Exception as e:
+            if json_mode and "response_format" in str(e):
+                # Some open-source models don't support response_format
+                kwargs.pop("response_format", None)
+                # Add JSON instruction to prompt instead
+                kwargs["messages"][-1]["content"] += "\n\nRespond ONLY with valid JSON."
+                resp = self._client.chat.completions.create(**kwargs)
+            else:
+                raise
+        usage = TokenUsage(
+            input_tokens=resp.usage.prompt_tokens if resp.usage else 0,
+            output_tokens=resp.usage.completion_tokens if resp.usage else 0,
+        )
+        return resp.choices[0].message.content, usage
+
+    def _call_anthropic(self, prompt, system, images, json_mode):
+        content = []
+        if images:
+            for img in images:
+                b64 = self._encode_image(img)
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": b64},
+                })
+        content.append({"type": "text", "text": prompt})
+
+        kwargs = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+        if system:
+            kwargs["system"] = system
+
+        resp = self._client.messages.create(**kwargs)
+        usage = TokenUsage(
+            input_tokens=resp.usage.input_tokens,
+            output_tokens=resp.usage.output_tokens,
+        )
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        return text, usage
+
+    def _call_google(self, prompt, system, images, json_mode):
+        # Try new google-genai SDK first (for Gemini 2.5+)
+        try:
+            from google import genai
+            from google.genai import types
+
+            client = self._client
+            if not hasattr(client, 'models'):
+                # Old SDK was initialized, re-init with new SDK
+                client = genai.Client()
+
+            parts = []
+            if images:
+                import PIL.Image
+                for img in images:
+                    path = Path(img) if not isinstance(img, Path) else img
+                    if path.exists():
+                        image_bytes = path.read_bytes()
+                        parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
+            parts.append(types.Part.from_text(text=prompt))
+
+            config = types.GenerateContentConfig(
+                max_output_tokens=self.max_tokens,
+                temperature=self.temperature,
+            )
+            if json_mode:
+                try:
+                    config.response_mime_type = "application/json"
+                except Exception:
+                    pass  # Older SDK versions may not support this
+            # Disable thinking for flash models
+            if "flash" in self.model.lower():
+                try:
+                    config.thinking_config = types.ThinkingConfig(thinking_budget=0)
+                except Exception:
+                    pass
+
+            if system:
+                config.system_instruction = system
+
+            resp = client.models.generate_content(
+                model=self.model,
+                contents=[types.Content(role="user", parts=parts)],
+                config=config,
+            )
+            text = resp.text
+            if text is None:
+                # Handle thinking models
+                try:
+                    for part in resp.candidates[0].content.parts:
+                        if hasattr(part, 'text') and part.text:
+                            text = part.text
+                            break
+                except (IndexError, AttributeError):
+                    pass
+                if text is None:
+                    text = ""
+
+            in_tok = resp.usage_metadata.prompt_token_count or 0 if resp.usage_metadata else 0
+            out_tok = resp.usage_metadata.candidates_token_count or 0 if resp.usage_metadata else 0
+            usage = TokenUsage(input_tokens=in_tok, output_tokens=out_tok)
+            return text, usage
+
+        except ImportError:
+            pass
+
+        # Fallback to old google-generativeai SDK
+        import PIL.Image
+        model = self._client.GenerativeModel(self.model, system_instruction=system or None)
+        parts = []
+        if images:
+            for img in images:
+                path = Path(img) if not isinstance(img, Path) else img
+                parts.append(PIL.Image.open(path))
+        parts.append(prompt)
+
+        resp = model.generate_content(parts)
+        in_tok = getattr(resp.usage_metadata, "prompt_token_count", 0) if hasattr(resp, "usage_metadata") else 0
+        out_tok = getattr(resp.usage_metadata, "candidates_token_count", 0) if hasattr(resp, "usage_metadata") else 0
+        usage = TokenUsage(input_tokens=in_tok, output_tokens=out_tok)
+        return resp.text, usage
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _encode_image(img: str | Path) -> str:
+        """Return base64-encoded image string."""
+        if isinstance(img, (str, Path)):
+            path = Path(img)
+            if path.exists():
+                return base64.b64encode(path.read_bytes()).decode()
+        # Assume already base64
+        return str(img)
